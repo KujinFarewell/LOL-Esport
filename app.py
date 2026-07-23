@@ -44,8 +44,8 @@ def read_matches(workbook_bytes: bytes) -> pd.DataFrame:
     data["red"] = data["red"].map(team_name)
     data["win"] = data["win"].map(team_name)
     for blue_column, red_column in STAT_COLUMNS.values():
-        data[blue_column] = pd.to_numeric(data[blue_column], errors="coerce").fillna(0)
-        data[red_column] = pd.to_numeric(data[red_column], errors="coerce").fillna(0)
+        data[blue_column] = pd.to_numeric(data[blue_column], errors="coerce")
+        data[red_column] = pd.to_numeric(data[red_column], errors="coerce")
     duration = pd.to_timedelta(data["duration"], errors="coerce")
     # 当前数据表把“30:22”这类 mm:ss 时长读取为“1 天 6:22”。
     # 将累计小时视作分钟、分钟视作秒，即可还原原始比赛时长。
@@ -76,20 +76,22 @@ def available_teams(data: pd.DataFrame) -> list[str]:
 
 def matches_for_team(data: pd.DataFrame, team: str) -> pd.DataFrame:
     """Build one complete, side-aware record for every finished game of a team."""
-    finished = data.loc[data["win"].notna()].copy()
+    finished = data.loc[data["win"].notna() & data["duration_seconds"].notna()].copy()
     blue_games = finished.loc[finished["blue"].eq(team)].copy()
     blue_games["side"] = "蓝方"
     blue_games["opponent"] = blue_games["red"]
     blue_games["won"] = blue_games["win"].eq(team)
-    for label, (blue_column, _) in STAT_COLUMNS.items():
+    for label, (blue_column, red_column) in STAT_COLUMNS.items():
         blue_games[label] = blue_games[blue_column]
+        blue_games[f"总{label}"] = blue_games[blue_column] + blue_games[red_column]
 
     red_games = finished.loc[finished["red"].eq(team)].copy()
     red_games["side"] = "红方"
     red_games["opponent"] = red_games["blue"]
     red_games["won"] = red_games["win"].eq(team)
-    for label, (_, red_column) in STAT_COLUMNS.items():
+    for label, (blue_column, red_column) in STAT_COLUMNS.items():
         red_games[label] = red_games[red_column]
+        red_games[f"总{label}"] = red_games[blue_column] + red_games[red_column]
 
     return pd.concat([blue_games, red_games], ignore_index=True)
 
@@ -120,21 +122,28 @@ def mark_duration_outliers(matches: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return marked, f"IQR 异常值剔除：已排除 {excluded} 场时长异常比赛（保留 {len(marked) - excluded}/{len(marked)} 场）。"
 
 
-def dashboard_table(matches: pd.DataFrame) -> pd.DataFrame:
+def average_or_dash(values: pd.Series) -> str:
+    values = values.dropna()
+    return f"{values.mean():.1f}" if not values.empty else "—"
+
+
+def dashboard_table(matches: pd.DataFrame, team: str | None = None) -> pd.DataFrame:
     groups = {
         "整体": matches,
         "蓝方": matches.loc[matches["side"].eq("蓝方")],
         "红方": matches.loc[matches["side"].eq("红方")],
     }
+    team_prefix = f"{team}" if team else "战队"
     rows = []
     rows.append({"指标": "纳入平均的场次", **{name: number_or_dash(len(group)) for name, group in groups.items()}})
     rows.append({"指标": "胜率", **{name: rate_or_dash(group) for name, group in groups.items()}})
-    for metric in STAT_COLUMNS:
-        rows.append({"指标": f"平均{metric}", **{name: f"{group[metric].mean():.1f}" if not group.empty else "—" for name, group in groups.items()}})
     rows.append({
         "指标": "平均比赛时长",
         **{name: as_minutes_seconds(group["duration_seconds"].mean()) for name, group in groups.items()},
     })
+    for metric in STAT_COLUMNS:
+        rows.append({"指标": f"{team_prefix}{metric}", **{name: average_or_dash(group[metric]) for name, group in groups.items()}})
+        rows.append({"指标": f"总{metric}", **{name: average_or_dash(group[f"总{metric}"]) for name, group in groups.items()}})
     return pd.DataFrame(rows)
 
 
@@ -162,10 +171,11 @@ def duration_profile(matches: pd.DataFrame, side: str, fallback: pd.Series) -> t
 
 
 def metric_profile(matches: pd.DataFrame, side: str, metric: str, fallback: float) -> float:
-    values = matches.loc[matches["side"].eq(side), metric]
+    values = matches.loc[matches["side"].eq(side), metric].dropna()
     if values.empty:
-        values = matches[metric]
-    return float(values.mean()) if not values.empty else fallback
+        values = matches[metric].dropna()
+    mean = float(values.mean()) if not values.empty else fallback
+    return 0.0 if pd.isna(mean) else mean
 
 
 def game_prediction(
@@ -200,9 +210,9 @@ def series_distribution(probabilities: list[float], wins_needed: int) -> dict[st
 def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, first_blue: str) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     _, first, _ = clean_team_matches(data, first_team)
     _, second, _ = clean_team_matches(data, second_team)
-    completed_durations = data.loc[data["win"].notna(), "duration_seconds"]
+    completed_durations = data.loc[data["win"].notna() & data["duration_seconds"].notna(), "duration_seconds"]
     fallback_metrics = {
-        label: float(pd.concat([data.loc[data["win"].notna(), blue], data.loc[data["win"].notna(), red]]).mean())
+        label: float(pd.concat([data.loc[data["win"].notna() & data["duration_seconds"].notna(), blue], data.loc[data["win"].notna() & data["duration_seconds"].notna(), red]]).dropna().mean())
         for label, (blue, red) in STAT_COLUMNS.items()
     }
     blue_first = first_blue == first_team
@@ -252,14 +262,14 @@ def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
     rate = f"{wins / len(included):.0%}" if len(included) else "—"
     first, second, third = st.columns(3)
     first.metric("胜率", rate, f"{wins} 胜 · {losses} 负" if len(played) else "暂无已完成对局")
-    second.metric("平均击杀数", f"{included['击杀数'].mean():.1f}" if not included.empty else "—", "每场比赛")
+    second.metric(f"{selected}击杀数", average_or_dash(included["击杀数"]) if not included.empty else "—", "纳入平均的每场数据")
     third.metric("平均比赛时长", as_minutes_seconds(average_duration), f"{len(future)} 场待赛")
     st.subheader("完整数据汇总")
     st.caption(iqr_note)
     if included.empty:
         st.info(f"{selected} 暂无已完成对局，赛果写入 Excel 后会自动计算全部指标。")
     else:
-        st.dataframe(dashboard_table(included), use_container_width=True, hide_index=True)
+        st.dataframe(dashboard_table(included, selected), use_container_width=True, hide_index=True)
         st.subheader("红蓝方胜率")
         st.bar_chart(included.groupby("side", sort=False)["won"].mean().reindex(["蓝方", "红方"]).fillna(0).mul(100).rename("胜率（%）"), y="胜率（%）")
     st.subheader("已完成对局")
@@ -270,11 +280,15 @@ def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
         played["结果"] = played["won"].map({True: "胜", False: "负"})
         played["时长"] = played["duration_seconds"].map(as_minutes_seconds)
         played["平均计算"] = played["纳入平均"].map({True: "纳入", False: "时长异常，剔除"})
-        fields = [field for field in ("date", "event", "side", "对手", "结果", "时长", *STAT_COLUMNS.keys(), "平均计算") if field in played.columns]
+        display_stats = []
+        for metric in STAT_COLUMNS:
+            display_stats.extend([f"总{metric}", metric])
+        fields = [field for field in ("date", "event", "side", "对手", "结果", "时长", *display_stats, "平均计算") if field in played.columns]
         result_table = played[fields].copy()
         if "date" in result_table:
             result_table["date"] = result_table["date"].map(display_date)
-        st.dataframe(result_table.rename(columns={"date": "日期", "event": "赛事", "side": "方位"}), use_container_width=True, hide_index=True)
+        rename_columns = {"date": "日期", "event": "赛事", "side": "方位", **{metric: f"{selected}{metric}" for metric in STAT_COLUMNS}}
+        st.dataframe(result_table.rename(columns=rename_columns), use_container_width=True, hide_index=True)
     st.subheader("待赛赛程")
     if future.empty:
         st.caption("暂无待赛赛程")
@@ -297,8 +311,9 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     first_matches = clean_team_matches(data, first_team)[1]
     second_matches = clean_team_matches(data, second_team)[1]
     st.subheader(f"{first_team} vs {second_team} 数据对比")
-    comparison = dashboard_table(first_matches)[["指标", "整体"]].rename(columns={"整体": first_team})
-    comparison[second_team] = dashboard_table(second_matches)["整体"]
+    comparison = dashboard_table(first_matches, first_team)[["指标", "整体"]].rename(columns={"整体": first_team})
+    second_table = dashboard_table(second_matches, second_team)[["指标", "整体"]].rename(columns={"整体": second_team})
+    comparison = comparison.merge(second_table, on="指标", how="outer")
     st.dataframe(comparison, use_container_width=True, hide_index=True)
     st.subheader("单局预测")
     st.caption(evidence + " 蓝红方按每局轮换计算；第 3–5 局仅在需要时进行。")
