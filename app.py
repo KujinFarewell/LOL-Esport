@@ -14,12 +14,13 @@ REQUIRED_COLUMNS = {
     "nashor_blue", "nashor_red",
 }
 
+# 按照指定优先级顺序排列指标
 STAT_COLUMNS = {
     "击杀数": ("kill_blue", "kill_red"),
     "推塔数": ("tower_blue", "tower_red"),
-    "inhibitor 数": ("inhibitor_blue", "inhibitor_red"),
     "小龙数": ("dragon_blue", "dragon_red"),
-    "nashor 数": ("nashor_blue", "nashor_red"),
+    "大龙数": ("nashor_blue", "nashor_red"),
+    "水晶数": ("inhibitor_blue", "inhibitor_red"),
 }
 
 
@@ -47,8 +48,6 @@ def read_matches(workbook_bytes: bytes) -> pd.DataFrame:
         data[blue_column] = pd.to_numeric(data[blue_column], errors="coerce")
         data[red_column] = pd.to_numeric(data[red_column], errors="coerce")
     duration = pd.to_timedelta(data["duration"], errors="coerce")
-    # 当前数据表把“30:22”这类 mm:ss 时长读取为“1 天 6:22”。
-    # 将累计小时视作分钟、分钟视作秒，即可还原原始比赛时长。
     parts = duration.dt.components
     data["duration_seconds"] = ((parts["days"] * 24 + parts["hours"]) * 60 + parts["minutes"])
     data.loc[duration.isna(), "duration_seconds"] = pd.NA
@@ -135,6 +134,7 @@ def dashboard_table(matches: pd.DataFrame, team: str | None = None) -> pd.DataFr
     }
     team_prefix = f"{team}" if team else "战队"
     rows = []
+    # 按照优先级排列：纳入场次、胜率、比赛时长、击杀数、推塔数、小龙数、大龙数、水晶数
     rows.append({"指标": "纳入平均的场次", **{name: number_or_dash(len(group)) for name, group in groups.items()}})
     rows.append({"指标": "胜率", **{name: rate_or_dash(group) for name, group in groups.items()}})
     rows.append({
@@ -223,17 +223,22 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
         second_side = "红方" if first_side == "蓝方" else "蓝方"
         probability, duration, interval = game_prediction(first, second, first_side, completed_durations)
         probabilities.append(probability)
+        
+        # 顺手按要求对齐顺序：时长 -> 胜率 -> 击杀 -> 推塔 -> 小龙 -> 大龙 -> 水晶
         game_row = {
             "对局": f"第 {game_number} 局",
             "蓝方": first_team if first_side == "蓝方" else second_team,
-            f"{first_team} 胜率": f"{probability:.1%}",
-            f"{second_team} 胜率": f"{1 - probability:.1%}",
             "预计时长": as_minutes_seconds(duration),
             "合理区间": f"{as_minutes_seconds(max(0, duration - interval))}–{as_minutes_seconds(duration + interval)}",
+            f"{first_team} 胜率": f"{probability:.1%}",
+            f"{second_team} 胜率": f"{1 - probability:.1%}",
         }
         for metric in STAT_COLUMNS:
-            game_row[f"{first_team} 预计{metric}"] = f"{metric_profile(first, first_side, metric, fallback_metrics[metric]):.1f}"
-            game_row[f"{second_team} 预计{metric}"] = f"{metric_profile(second, second_side, metric, fallback_metrics[metric]):.1f}"
+            v1 = metric_profile(first, first_side, metric, fallback_metrics[metric])
+            v2 = metric_profile(second, second_side, metric, fallback_metrics[metric])
+            game_row[f"{first_team}预计{metric}"] = f"{v1:.1f}"
+            game_row[f"{second_team}预计{metric}"] = f"{v2:.1f}"
+            game_row[f"预计总{metric}"] = f"{v1 + v2:.1f}"  # 新增：预计全场总数据
         game_rows.append(game_row)
 
     series_rows = []
@@ -249,6 +254,66 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
     if len(first) < 5 or len(second) < 5:
         evidence += " 样本较少，结果仅供参考。"
     return pd.DataFrame(game_rows), pd.DataFrame(series_rows), evidence
+
+
+def calculate_diff(val1: str, val2: str, is_time: bool = False) -> str:
+    """计算两队数据差值 (队 A - 队 B)，自动格式化显示。"""
+    if val1 == "—" or val2 == "—":
+        return "—"
+    try:
+        if is_time:
+            m1, s1 = map(int, val1.split(":"))
+            m2, s2 = map(int, val2.split(":"))
+            diff_sec = (m1 * 60 + s1) - (m2 * 60 + s2)
+            sign = "+" if diff_sec > 0 else ("-" if diff_sec < 0 else "")
+            abs_sec = abs(diff_sec)
+            return f"{sign}{abs_sec // 60}:{abs_sec % 60:02d}"
+        elif "%" in val1 and "%" in val2:
+            f1 = float(val1.replace("%", ""))
+            f2 = float(val2.replace("%", ""))
+            diff = f1 - f2
+            return f"{diff:+.1f}%"
+        else:
+            f1, f2 = float(val1), float(val2)
+            diff = f1 - f2
+            return f"{diff:+.1f}" if "." in val1 or "." in val2 else f"{int(diff):+d}"
+    except ValueError:
+        return "—"
+
+
+def style_comparison(row):
+    """Pandas Styler：为胜率、击杀等指标的优势方（数值较大）标绿"""
+    styles = pd.Series([''] * len(row), index=row.index)
+    metric = row['指标']
+    
+    # 场次、时长、以及“总计”数据不做优劣势颜色标记，保持中性
+    if metric in ['纳入平均的场次', '平均比赛时长'] or metric.startswith('总'):
+        return styles
+
+    t1_col, t2_col = row.index[1], row.index[2] 
+    v1, v2 = str(row[t1_col]), str(row[t2_col])
+
+    if v1 == '—' or v2 == '—':
+        return styles
+
+    try:
+        if '%' in v1:
+            f1 = float(v1.strip('%'))
+            f2 = float(v2.strip('%'))
+        else:
+            f1 = float(v1)
+            f2 = float(v2)
+
+        # 胜率、各项资源击杀数等均是“越高越好”，故较大值标绿
+        highlight = 'color: #00c853; font-weight: bold;'
+        if f1 > f2:
+            styles[t1_col] = highlight
+        elif f2 > f1:
+            styles[t2_col] = highlight
+    except:
+        pass
+        
+    return styles
 
 
 def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
@@ -310,14 +375,45 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     game_table, series_table, evidence = matchup_forecast(data, first_team, second_team, first_blue)
     first_matches = clean_team_matches(data, first_team)[1]
     second_matches = clean_team_matches(data, second_team)[1]
+    
     st.subheader(f"{first_team} vs {second_team} 数据对比")
-    comparison = dashboard_table(first_matches, first_team)[["指标", "整体"]].rename(columns={"整体": first_team})
-    second_table = dashboard_table(second_matches, second_team)[["指标", "整体"]].rename(columns={"整体": second_team})
-    comparison = comparison.merge(second_table, on="指标", how="outer")
-    st.dataframe(comparison, use_container_width=True, hide_index=True)
+    
+    table1 = dashboard_table(first_matches, first_team)[["指标", "整体"]].rename(columns={"整体": first_team})
+    table2 = dashboard_table(second_matches, second_team)[["指标", "整体"]].rename(columns={"整体": second_team})
+    
+    table1["通用指标"] = table1["指标"].apply(lambda x: x.replace(first_team, "") if x.startswith(first_team) else x)
+    table2["通用指标"] = table2["指标"].apply(lambda x: x.replace(second_team, "") if x.startswith(second_team) else x)
+    
+    comparison = table1.merge(table2, on="通用指标", how="outer", suffixes=("", "_drop"))
+    
+    # 构建绝对对齐的排序列表
+    ordered_metrics = ["纳入平均的场次", "胜率", "平均比赛时长"]
+    for m in STAT_COLUMNS:
+        ordered_metrics.extend([m, f"总{m}"])
+    
+    comparison["指标"] = comparison["通用指标"]
+    comparison = comparison[["指标", first_team, second_team]]
+    
+    # 执行强排序，确保不管是外联结怎么弄，输出必须严格遵循排序优先级
+    comparison['sort_key'] = comparison['指标'].apply(lambda x: ordered_metrics.index(x) if x in ordered_metrics else 999)
+    comparison = comparison.sort_values('sort_key').drop(columns=['sort_key']).reset_index(drop=True)
+    
+    # 计算差异列
+    diffs = []
+    for _, row in comparison.iterrows():
+        is_time = row["指标"] == "平均比赛时长"
+        diffs.append(calculate_diff(str(row[first_team]), str(row[second_team]), is_time=is_time))
+    
+    comparison[f"差异 ({first_team} - {second_team})"] = diffs
+    
+    # 渲染带有标绿高亮的对比表格
+    styled_comparison = comparison.style.apply(style_comparison, axis=1)
+    st.dataframe(styled_comparison, use_container_width=True, hide_index=True)
+    
     st.subheader("单局预测")
     st.caption(evidence + " 蓝红方按每局轮换计算；第 3–5 局仅在需要时进行。")
     st.dataframe(game_table, use_container_width=True, hide_index=True)
+    
     st.subheader("BO1、BO3、BO5 系列赛预测")
     st.dataframe(series_table, use_container_width=True, hide_index=True)
 
