@@ -134,7 +134,6 @@ def dashboard_table(matches: pd.DataFrame, team: str | None = None) -> pd.DataFr
     }
     team_prefix = f"{team}" if team else "战队"
     rows = []
-    # 按照优先级排列：纳入场次、胜率、比赛时长、击杀数、推塔数、小龙数、大龙数、水晶数
     rows.append({"指标": "纳入平均的场次", **{name: number_or_dash(len(group)) for name, group in groups.items()}})
     rows.append({"指标": "胜率", **{name: rate_or_dash(group) for name, group in groups.items()}})
     rows.append({
@@ -210,21 +209,46 @@ def series_distribution(probabilities: list[float], wins_needed: int) -> dict[st
 def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, first_blue: str) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     _, first, _ = clean_team_matches(data, first_team)
     _, second, _ = clean_team_matches(data, second_team)
+    
+    # 获取双方直接交手记录 (H2H)
+    first_h2h = first.loc[first["opponent"] == second_team]
+    second_h2h = second.loc[second["opponent"] == first_team]
+    
+    # 计算动态权重：每多交手1局增加15%权重，最高封顶 70% (0.7)
+    h2h_count = len(first_h2h)
+    w_h2h = min(0.70, h2h_count * 0.15)
+    w_gen = 1.0 - w_h2h
+
     completed_durations = data.loc[data["win"].notna() & data["duration_seconds"].notna(), "duration_seconds"]
     fallback_metrics = {
         label: float(pd.concat([data.loc[data["win"].notna() & data["duration_seconds"].notna(), blue], data.loc[data["win"].notna() & data["duration_seconds"].notna(), red]]).dropna().mean())
         for label, (blue, red) in STAT_COLUMNS.items()
     }
+    
     blue_first = first_blue == first_team
     game_rows = []
     probabilities: list[float] = []
+    
     for game_number in range(1, 6):
         first_side = "蓝方" if (game_number % 2 == 1) == blue_first else "红方"
         second_side = "红方" if first_side == "蓝方" else "蓝方"
-        probability, duration, interval = game_prediction(first, second, first_side, completed_durations)
+        
+        # 1. 计算常规宏观预测数据
+        gen_prob, gen_duration, interval = game_prediction(first, second, first_side, completed_durations)
+        
+        # 2. 如果存在交手记录，通过动态权重混合预测数据
+        if h2h_count > 0:
+            h2h_prob = first_h2h["won"].mean()
+            h2h_duration = first_h2h["duration_seconds"].mean()
+            
+            probability = w_h2h * h2h_prob + w_gen * gen_prob
+            duration = w_h2h * h2h_duration + w_gen * gen_duration
+        else:
+            probability = gen_prob
+            duration = gen_duration
+            
         probabilities.append(probability)
         
-        # 顺手按要求对齐顺序：时长 -> 胜率 -> 击杀 -> 推塔 -> 小龙 -> 大龙 -> 水晶
         game_row = {
             "对局": f"第 {game_number} 局",
             "蓝方": first_team if first_side == "蓝方" else second_team,
@@ -233,12 +257,27 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
             f"{first_team} 胜率": f"{probability:.1%}",
             f"{second_team} 胜率": f"{1 - probability:.1%}",
         }
+        
+        # 3. 对各项资源指标也应用动态权重混合
         for metric in STAT_COLUMNS:
-            v1 = metric_profile(first, first_side, metric, fallback_metrics[metric])
-            v2 = metric_profile(second, second_side, metric, fallback_metrics[metric])
+            v1_gen = metric_profile(first, first_side, metric, fallback_metrics[metric])
+            v2_gen = metric_profile(second, second_side, metric, fallback_metrics[metric])
+            
+            if h2h_count > 0:
+                # 在交手记录中查找对应方位的数据，如果方位样本缺失则回退到其交手综合数据
+                v1_h2h = metric_profile(first_h2h, first_side, metric, v1_gen)
+                v2_h2h = metric_profile(second_h2h, second_side, metric, v2_gen)
+                
+                v1 = w_h2h * v1_h2h + w_gen * v1_gen
+                v2 = w_h2h * v2_h2h + w_gen * v2_gen
+            else:
+                v1 = v1_gen
+                v2 = v2_gen
+                
             game_row[f"{first_team}预计{metric}"] = f"{v1:.1f}"
             game_row[f"{second_team}预计{metric}"] = f"{v2:.1f}"
-            game_row[f"预计总{metric}"] = f"{v1 + v2:.1f}"  # 新增：预计全场总数据
+            game_row[f"预计总{metric}"] = f"{v1 + v2:.1f}"
+            
         game_rows.append(game_row)
 
     series_rows = []
@@ -251,13 +290,15 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
         series_rows.append({"赛制": label, f"{first_team} 系列赛胜率": f"{first_total:.1%}", f"{second_team} 系列赛胜率": f"{second_total:.1%}", f"{first_team} 比分概率": first_scores, f"{second_team} 比分概率": second_scores})
 
     evidence = f"预测样本：{first_team} {len(first)} 场、{second_team} {len(second)} 场。"
+    if h2h_count > 0:
+         evidence += f" 🛡️ 启用动态权重：混合 {h2h_count} 场历史交锋记录 (H2H 权重 {(w_h2h*100):.0f}%)。"
     if len(first) < 5 or len(second) < 5:
-        evidence += " 样本较少，结果仅供参考。"
+        evidence += " ⚠️ 样本较少，结果仅供参考。"
+        
     return pd.DataFrame(game_rows), pd.DataFrame(series_rows), evidence
 
 
 def calculate_diff(val1: str, val2: str, is_time: bool = False) -> str:
-    """计算两队数据差值 (队 A - 队 B)，自动格式化显示。"""
     if val1 == "—" or val2 == "—":
         return "—"
     try:
@@ -282,11 +323,8 @@ def calculate_diff(val1: str, val2: str, is_time: bool = False) -> str:
 
 
 def style_comparison(row):
-    """Pandas Styler：为胜率、击杀等指标的优势方（数值较大）标绿"""
     styles = pd.Series([''] * len(row), index=row.index)
     metric = row['指标']
-    
-    # 场次、时长、以及“总计”数据不做优劣势颜色标记，保持中性
     if metric in ['纳入平均的场次', '平均比赛时长'] or metric.startswith('总'):
         return styles
 
@@ -304,7 +342,6 @@ def style_comparison(row):
             f1 = float(v1)
             f2 = float(v2)
 
-        # 胜率、各项资源击杀数等均是“越高越好”，故较大值标绿
         highlight = 'color: #00c853; font-weight: bold;'
         if f1 > f2:
             styles[t1_col] = highlight
@@ -372,11 +409,49 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     remaining = [team for team in teams if team != first_team]
     second_team = second_column.selectbox("队伍 B", remaining, index=remaining.index("T1") if "T1" in remaining else 0)
     first_blue = st.selectbox("第 1 局蓝方", [first_team, second_team])
+    
+    h2h_condition = (
+        ((data["blue"] == first_team) & (data["red"] == second_team)) |
+        ((data["blue"] == second_team) & (data["red"] == first_team))
+    )
+    h2h_matches = data.loc[h2h_condition & data["win"].notna() & data["duration_seconds"].notna()].copy()
+
+    st.markdown("---")
+    st.subheader(f"⚔️ {first_team} vs {second_team} 历史交锋记录 (H2H)")
+    
+    if h2h_matches.empty:
+        st.info("📊 暂无这两支战队的直接交手记录，预测将100%参照基础常规数据。")
+    else:
+        first_wins = (h2h_matches["win"] == first_team).sum()
+        second_wins = (h2h_matches["win"] == second_team).sum()
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("交手总场次", f"{len(h2h_matches)} 场")
+        col2.metric(f"{first_team} 胜场", f"{first_wins} 胜")
+        col3.metric(f"{second_team} 胜场", f"{second_wins} 胜")
+        
+        h2h_display = h2h_matches.copy()
+        h2h_display["胜者"] = h2h_display["win"]
+        h2h_display["时长"] = h2h_display["duration_seconds"].map(as_minutes_seconds)
+        
+        display_fields = ["date", "event", "blue", "red", "胜者", "时长"]
+        h2h_display = h2h_display[[f for f in display_fields if f in h2h_display.columns]]
+        
+        if "date" in h2h_display.columns:
+            h2h_display["date"] = h2h_display["date"].map(display_date)
+            
+        h2h_display = h2h_display.rename(columns={
+            "date": "日期", "event": "赛事", "blue": "蓝方", "red": "红方"
+        })
+        
+        st.dataframe(h2h_display, use_container_width=True, hide_index=True)
+
     game_table, series_table, evidence = matchup_forecast(data, first_team, second_team, first_blue)
     first_matches = clean_team_matches(data, first_team)[1]
     second_matches = clean_team_matches(data, second_team)[1]
     
-    st.subheader(f"{first_team} vs {second_team} 数据对比")
+    st.markdown("---")
+    st.subheader("整体数据对比")
     
     table1 = dashboard_table(first_matches, first_team)[["指标", "整体"]].rename(columns={"整体": first_team})
     table2 = dashboard_table(second_matches, second_team)[["指标", "整体"]].rename(columns={"整体": second_team})
@@ -386,7 +461,6 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     
     comparison = table1.merge(table2, on="通用指标", how="outer", suffixes=("", "_drop"))
     
-    # 构建绝对对齐的排序列表
     ordered_metrics = ["纳入平均的场次", "胜率", "平均比赛时长"]
     for m in STAT_COLUMNS:
         ordered_metrics.extend([m, f"总{m}"])
@@ -394,11 +468,9 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     comparison["指标"] = comparison["通用指标"]
     comparison = comparison[["指标", first_team, second_team]]
     
-    # 执行强排序，确保不管是外联结怎么弄，输出必须严格遵循排序优先级
     comparison['sort_key'] = comparison['指标'].apply(lambda x: ordered_metrics.index(x) if x in ordered_metrics else 999)
     comparison = comparison.sort_values('sort_key').drop(columns=['sort_key']).reset_index(drop=True)
     
-    # 计算差异列
     diffs = []
     for _, row in comparison.iterrows():
         is_time = row["指标"] == "平均比赛时长"
@@ -406,12 +478,11 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     
     comparison[f"差异 ({first_team} - {second_team})"] = diffs
     
-    # 渲染带有标绿高亮的对比表格
     styled_comparison = comparison.style.apply(style_comparison, axis=1)
     st.dataframe(styled_comparison, use_container_width=True, hide_index=True)
     
-    st.subheader("单局预测")
-    st.caption(evidence + " 蓝红方按每局轮换计算；第 3–5 局仅在需要时进行。")
+    st.subheader("单局混合预测")
+    st.caption(evidence + " (蓝红方按每局轮换；第 3–5 局仅在需要时进行)")
     st.dataframe(game_table, use_container_width=True, hide_index=True)
     
     st.subheader("BO1、BO3、BO5 系列赛预测")
@@ -421,7 +492,7 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
 def main() -> None:
     st.set_page_config(page_title="LOL 战队数据看板", page_icon="🎮", layout="wide")
     st.title("LOL 战队数据看板")
-    st.caption("上传更新后的 Excel，即可查看战队数据、对战比较和 BO 系列赛预测。")
+    st.caption("上传更新后的 Excel，即可查看战队数据、交手记录和 BO 系列赛动态预测。")
     uploaded = st.file_uploader("选择比赛数据 Excel", type=["xlsx"])
     if uploaded is None:
         st.info("请选择包含 `match` 工作表的 Excel 文件。")
