@@ -387,12 +387,25 @@ def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
         fk_games = included.dropna(subset=["got_first_kill"])
         ft_games = included.dropna(subset=["got_first_tower"])
         
-        fk_win_rate = (fk_games.loc[fk_games["got_first_kill"], "won"].mean() if not fk_games.empty else 0) * 100
-        ft_win_rate = (ft_games.loc[ft_games["got_first_tower"], "won"].mean() if not ft_games.empty else 0) * 100
+        # 筛选出该队【实际拿到一血/一塔】的对局胜负情况
+        fk_won = included.loc[included["got_first_kill"].eq(True), "won"]
+        ft_won = included.loc[included["got_first_tower"].eq(True), "won"]
+        
+        # 若子集为空或均值为 NaN，直接显示 "—"；否则格式化显示百分比
+        fk_win_rate_str = f"{fk_won.mean():.1%}" if not fk_won.empty and pd.notna(fk_won.mean()) else "—"
+        ft_win_rate_str = f"{ft_won.mean():.1%}" if not ft_won.empty and pd.notna(ft_won.mean()) else "—"
         
         col_a, col_b = st.columns(2)
-        col_a.metric("拿到【一血】时的胜率", f"{fk_win_rate:.1f}%" if not fk_games.empty else "—", f"基于 {len(fk_games)} 场有效样本")
-        col_b.metric("拿到【一塔】时的胜率", f"{ft_win_rate:.1f}%" if not ft_games.empty else "—", f"基于 {len(ft_games)} 场有效样本")
+        col_a.metric(
+            "拿到【一血】时的胜率", 
+            fk_win_rate_str, 
+            f"基于 {len(fk_games)} 场有效样本（触发 {len(fk_won)} 次）"
+        )
+        col_b.metric(
+            "拿到【一塔】时的胜率", 
+            ft_win_rate_str, 
+            f"基于 {len(ft_games)} 场有效样本（触发 {len(ft_won)} 次）"
+        )
         
         st.subheader("红蓝方胜率")
         st.bar_chart(included.groupby("side", sort=False)["won"].mean().reindex(["蓝方", "红方"]).fillna(0).mul(100).rename("胜率（%）"), y="胜率（%）")
@@ -434,9 +447,19 @@ def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
 def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     first_column, second_column = st.columns(2)
     
-    # 修复：设置 index=None 默认为空；队伍 B 采用完整的 teams 列表，防止列表变动导致选择被重置
-    first_team = first_column.selectbox("队伍 A", teams, index=None, placeholder="请选择队伍 A")
-    second_team = second_column.selectbox("队伍 B", teams, index=None, placeholder="请选择队伍 B")
+    # 动态获取 session_state 中保存的历史选择索引
+    idx_a = teams.index(st.session_state["team_a"]) if st.session_state.get("team_a") in teams else None
+    idx_b = teams.index(st.session_state["team_b"]) if st.session_state.get("team_b") in teams else None
+
+    first_team = first_column.selectbox(
+        "队伍 A", teams, index=idx_a, placeholder="请选择队伍 A", key="select_team_a"
+    )
+    st.session_state["team_a"] = first_team
+
+    second_team = second_column.selectbox(
+        "队伍 B", teams, index=idx_b, placeholder="请选择队伍 B", key="select_team_b"
+    )
+    st.session_state["team_b"] = second_team
     
     # 检查是否两支队伍都已选择
     if not first_team or not second_team:
@@ -448,8 +471,14 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
         st.warning("⚠️ 队伍 A 和 队伍 B 不能相同，请选择两支不同的队伍！")
         return
         
-    # 第 1 局蓝方同样默认为空
-    first_blue = st.selectbox("第 1 局蓝方", [first_team, second_team], index=None, placeholder="请选择首局蓝方队伍")
+    # 第 1 局蓝方选择及状态保留
+    blue_options = [first_team, second_team]
+    idx_blue = blue_options.index(st.session_state["first_blue"]) if st.session_state.get("first_blue") in blue_options else None
+
+    first_blue = st.selectbox(
+        "第 1 局蓝方", blue_options, index=idx_blue, placeholder="请选择首局蓝方队伍", key="select_first_blue"
+    )
+    st.session_state["first_blue"] = first_blue
     
     if not first_blue:
         st.info("💡 请选择首局位于蓝方的队伍以查看完整数据。")
@@ -538,6 +567,12 @@ def main() -> None:
     st.set_page_config(page_title="LOL 战队数据看板", page_icon="🎮", layout="wide")
     st.title("LOL 战队数据看板")
     st.caption("上传更新后的 Excel，即可查看战队数据、交手记录和 BO 系列赛动态预测。")
+    
+    # 初始化全局战队选择状态（首次启动全为 None，即置空）
+    for state_key in ["selected_team", "team_a", "team_b", "first_blue"]:
+        if state_key not in st.session_state:
+            st.session_state[state_key] = None
+
     uploaded = st.file_uploader("选择比赛数据 Excel", type=["xlsx"])
     if uploaded is None:
         st.info("请选择包含 `match` 工作表的 Excel 文件。")
@@ -554,8 +589,12 @@ def main() -> None:
     mode = st.radio("查看方式", ["单队数据", "对战预测"], horizontal=True)
     
     if mode == "单队数据":
-        # 修复：设置 index=None 默认为空
-        selected = st.selectbox("选择战队", teams, index=None, placeholder="请选择战队")
+        # 获取单队历史选择索引
+        idx_single = teams.index(st.session_state["selected_team"]) if st.session_state.get("selected_team") in teams else None
+        
+        selected = st.selectbox("选择战队", teams, index=idx_single, placeholder="请选择战队", key="select_single_team")
+        st.session_state["selected_team"] = selected
+        
         if selected:
             render_team_dashboard(data, selected)
         else:
