@@ -326,11 +326,73 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
     series_rows = []
     for label, wins_needed in (("BO1", 1), ("BO3", 2), ("BO5", 3)):
         outcomes = series_distribution(probabilities[: 2 * wins_needed - 1], wins_needed)
+        
+        # 计算队伍 A 的总胜率
         first_total = sum(chance for score, chance in outcomes.items() if int(score.split(":")[0]) == wins_needed)
         second_total = 1 - first_total
-        first_scores = "、".join(f"{score} {chance:.1%}" for score, chance in outcomes.items() if score.startswith(str(wins_needed) + ":"))
-        second_scores = "、".join(f"{score} {chance:.1%}" for score, chance in outcomes.items() if score.endswith(":" + str(wins_needed)))
-        series_rows.append({"赛制": label, f"{first_team} 系列赛胜率": f"{first_total:.1%}", f"{second_team} 系列赛胜率": f"{second_total:.1%}", f"{first_team} 比分概率": first_scores, f"{second_team} 比分概率": second_scores})
+        
+        # 按照队伍 A 的视角进行排序：大胜 -> 险胜 -> 惜败 -> 惨败
+        # 通过计算 (A队得分 - B队得分) 的净胜分作为排序权重
+        def sort_key(item: tuple[str, float]) -> int:
+            w1, w2 = map(int, item[0].split(':'))
+            return w1 - w2
+            
+        sorted_outcomes = sorted(outcomes.items(), key=sort_key, reverse=True)
+        
+        # 将所有比分概率合并为一个清晰的字符串分布
+        distribution_text = " | ".join(f"{score} ({chance:.1%})" for score, chance in sorted_outcomes)
+        
+        series_rows.append({
+            "赛制": label, 
+            f"{first_team} 胜率": f"{first_total:.1%}", 
+            f"{second_team} 胜率": f"{second_total:.1%}", 
+            f"比分分布 ({first_team} 视角)": distribution_text
+        })
+        
+    evidence = f"预测样本：{first_team} {len(first)} 场、{second_team} {len(second)} 场。"
+    if h2h_count > 0:
+         evidence += f" 🛡️ 启用动态权重：混合 {h2h_count} 场历史交锋记录 (H2H 权重 {(w_h2h*100):.0f}%)。"
+    if len(first) < 5 or len(second) < 5:
+        evidence += " ⚠️ 样本较少，结果仅供参考。"
+        
+    return pd.DataFrame(game_rows), pd.DataFrame(series_rows), evidence
+# 从这里开始替换
+    series_rows = []
+    for label, wins_needed in (("BO1", 1), ("BO3", 2), ("BO5", 3)):
+        outcomes = series_distribution(probabilities[: 2 * wins_needed - 1], wins_needed)
+        
+        # 1. 计算系列赛大盘总胜率
+        first_total = sum(chance for score, chance in outcomes.items() if int(score.split(":")[0]) == wins_needed)
+        second_total = 1 - first_total
+        total_rate_str = f"{first_team} {first_total:.1%} | {second_total:.1%} {second_team}"
+        
+        # 2. 将比分按 完胜、打满 等赛况进行对称的【分行分列】拆解
+        for opponent_wins in range(wins_needed):
+            # 构建对称的 A队获胜比分 (如 3:0) 与 B队获胜比分 (如 0:3，A视角)
+            first_win_score = f"{wins_needed}:{opponent_wins}"
+            second_win_score = f"{opponent_wins}:{wins_needed}"
+            
+            first_prob = outcomes.get(first_win_score, 0.0)
+            second_prob = outcomes.get(second_win_score, 0.0)
+            
+            # 3. 补充易读的赛况标签
+            if opponent_wins == 0:
+                situation = "横扫 (零封)" if wins_needed > 1 else "单局决胜"
+            elif opponent_wins == wins_needed - 1:
+                situation = "打满决胜局"
+            else:
+                situation = "常规交锋"
+                
+            # 4. 生成高度结构化的独立行
+            series_rows.append({
+                "赛制": label,
+                "系列赛总胜率": total_rate_str,
+                "赛况": situation,
+                f"{first_team} 胜出比分": first_win_score,
+                f"{first_team} 概率": f"{first_prob:.1%}",
+                f"{second_team} 胜出比分": second_win_score,
+                f"{second_team} 概率": f"{second_prob:.1%}"
+            })
 
     evidence = f"预测样本：{first_team} {len(first)} 场、{second_team} {len(second)} 场。"
     if h2h_count > 0:
@@ -339,7 +401,6 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
         evidence += " ⚠️ 样本较少，结果仅供参考。"
         
     return pd.DataFrame(game_rows), pd.DataFrame(series_rows), evidence
-
 
 def calculate_diff(val1: str, val2: str, is_time: bool = False) -> str:
     if val1 == "—" or val2 == "—":
