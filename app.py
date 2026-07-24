@@ -433,10 +433,27 @@ def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
 
 def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     first_column, second_column = st.columns(2)
-    first_team = first_column.selectbox("队伍 A", teams, index=teams.index("DK") if "DK" in teams else 0)
-    remaining = [team for team in teams if team != first_team]
-    second_team = second_column.selectbox("队伍 B", remaining, index=remaining.index("T1") if "T1" in remaining else 0)
-    first_blue = st.selectbox("第 1 局蓝方", [first_team, second_team])
+    
+    # 修复：设置 index=None 默认为空；队伍 B 采用完整的 teams 列表，防止列表变动导致选择被重置
+    first_team = first_column.selectbox("队伍 A", teams, index=None, placeholder="请选择队伍 A")
+    second_team = second_column.selectbox("队伍 B", teams, index=None, placeholder="请选择队伍 B")
+    
+    # 检查是否两支队伍都已选择
+    if not first_team or not second_team:
+        st.info("💡 请在上方选择两支队伍以生成对战预测。")
+        return
+        
+    # 增加校验：防止用户在 A 和 B 中选择了同一支队伍
+    if first_team == second_team:
+        st.warning("⚠️ 队伍 A 和 队伍 B 不能相同，请选择两支不同的队伍！")
+        return
+        
+    # 第 1 局蓝方同样默认为空
+    first_blue = st.selectbox("第 1 局蓝方", [first_team, second_team], index=None, placeholder="请选择首局蓝方队伍")
+    
+    if not first_blue:
+        st.info("💡 请选择首局位于蓝方的队伍以查看完整数据。")
+        return
     
     h2h_condition = (
         ((data["blue"] == first_team) & (data["red"] == second_team)) |
@@ -489,7 +506,6 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     
     comparison = table1.merge(table2, on="通用指标", how="outer", suffixes=("", "_drop"))
     
-    # 调整排序指标：包含一血率和一塔率
     ordered_metrics = ["纳入平均的场次", "胜率", "一血率", "一塔率", "平均比赛时长"]
     for m in STAT_COLUMNS:
         ordered_metrics.extend([m, f"总{m}"])
@@ -536,12 +552,16 @@ def main() -> None:
         st.warning("文件中没有可识别的战队名称。")
         return
     mode = st.radio("查看方式", ["单队数据", "对战预测"], horizontal=True)
+    
     if mode == "单队数据":
-        selected = st.selectbox("选择战队", teams, index=teams.index("T1") if "T1" in teams else 0)
-        render_team_dashboard(data, selected)
+        # 修复：设置 index=None 默认为空
+        selected = st.selectbox("选择战队", teams, index=None, placeholder="请选择战队")
+        if selected:
+            render_team_dashboard(data, selected)
+        else:
+            st.info("💡 请在上方下拉框中选择一支战队以查看单队数据。")
     else:
         render_matchup_dashboard(data, teams)
-
 
 if __name__ == "__main__":
     main()
