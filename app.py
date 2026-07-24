@@ -10,17 +10,16 @@ import streamlit as st
 REQUIRED_COLUMNS = {
     "blue", "red", "win", "duration",
     "kill_blue", "kill_red", "tower_blue", "tower_red",
-    "inhibitor_blue", "inhibitor_red", "dragon_blue", "dragon_red",
-    "nashor_blue", "nashor_red",
+    "dragon_blue", "dragon_red", "nashor_blue", "nashor_red",
+    "first_kill", "first_tower",
 }
 
-# 按照指定优先级顺序排列指标
+# 按照指定优先级顺序排列指标（已移除水晶数，新增一血和一塔在单独模块或特定逻辑中展示）
 STAT_COLUMNS = {
     "击杀数": ("kill_blue", "kill_red"),
     "推塔数": ("tower_blue", "tower_red"),
     "小龙数": ("dragon_blue", "dragon_red"),
     "大龙数": ("nashor_blue", "nashor_red"),
-    "水晶数": ("inhibitor_blue", "inhibitor_red"),
 }
 
 
@@ -44,9 +43,13 @@ def read_matches(workbook_bytes: bytes) -> pd.DataFrame:
     data["blue"] = data["blue"].map(team_name)
     data["red"] = data["red"].map(team_name)
     data["win"] = data["win"].map(team_name)
+    data["first_kill"] = data["first_kill"].map(team_name)
+    data["first_tower"] = data["first_tower"].map(team_name)
+    
     for blue_column, red_column in STAT_COLUMNS.values():
         data[blue_column] = pd.to_numeric(data[blue_column], errors="coerce")
         data[red_column] = pd.to_numeric(data[red_column], errors="coerce")
+        
     duration = pd.to_timedelta(data["duration"], errors="coerce")
     parts = duration.dt.components
     data["duration_seconds"] = ((parts["days"] * 24 + parts["hours"]) * 60 + parts["minutes"])
@@ -76,10 +79,14 @@ def available_teams(data: pd.DataFrame) -> list[str]:
 def matches_for_team(data: pd.DataFrame, team: str) -> pd.DataFrame:
     """Build one complete, side-aware record for every finished game of a team."""
     finished = data.loc[data["win"].notna() & data["duration_seconds"].notna()].copy()
+    
     blue_games = finished.loc[finished["blue"].eq(team)].copy()
     blue_games["side"] = "蓝方"
     blue_games["opponent"] = blue_games["red"]
     blue_games["won"] = blue_games["win"].eq(team)
+    blue_games["got_first_kill"] = blue_games["first_kill"].eq(team)
+    blue_games["got_first_tower"] = blue_games["first_tower"].eq(team)
+    
     for label, (blue_column, red_column) in STAT_COLUMNS.items():
         blue_games[label] = blue_games[blue_column]
         blue_games[f"总{label}"] = blue_games[blue_column] + blue_games[red_column]
@@ -88,6 +95,9 @@ def matches_for_team(data: pd.DataFrame, team: str) -> pd.DataFrame:
     red_games["side"] = "红方"
     red_games["opponent"] = red_games["blue"]
     red_games["won"] = red_games["win"].eq(team)
+    red_games["got_first_kill"] = red_games["first_kill"].eq(team)
+    red_games["got_first_tower"] = red_games["first_tower"].eq(team)
+    
     for label, (blue_column, red_column) in STAT_COLUMNS.items():
         red_games[label] = red_games[red_column]
         red_games[f"总{label}"] = red_games[blue_column] + red_games[red_column]
@@ -99,8 +109,11 @@ def number_or_dash(value: float | int) -> str:
     return str(int(value)) if pd.notna(value) else "—"
 
 
-def rate_or_dash(games: pd.DataFrame) -> str:
-    return f"{games['won'].mean():.1%}" if not games.empty else "—"
+def rate_or_dash(games: pd.DataFrame, column: str = "won") -> str:
+    if games.empty or column not in games.columns:
+        return "—"
+    valid = games[column].dropna()
+    return f"{valid.mean():.1%}" if not valid.empty else "—"
 
 
 def mark_duration_outliers(matches: pd.DataFrame) -> tuple[pd.DataFrame, str]:
@@ -135,7 +148,9 @@ def dashboard_table(matches: pd.DataFrame, team: str | None = None) -> pd.DataFr
     team_prefix = f"{team}" if team else "战队"
     rows = []
     rows.append({"指标": "纳入平均的场次", **{name: number_or_dash(len(group)) for name, group in groups.items()}})
-    rows.append({"指标": "胜率", **{name: rate_or_dash(group) for name, group in groups.items()}})
+    rows.append({"指标": "胜率", **{name: rate_or_dash(group, "won") for name, group in groups.items()}})
+    rows.append({"指标": "一血率", **{name: rate_or_dash(group, "got_first_kill") for name, group in groups.items()}})
+    rows.append({"指标": "一塔率", **{name: rate_or_dash(group, "got_first_tower") for name, group in groups.items()}})
     rows.append({
         "指标": "平均比赛时长",
         **{name: as_minutes_seconds(group["duration_seconds"].mean()) for name, group in groups.items()},
@@ -210,11 +225,9 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
     _, first, _ = clean_team_matches(data, first_team)
     _, second, _ = clean_team_matches(data, second_team)
     
-    # 获取双方直接交手记录 (H2H)
     first_h2h = first.loc[first["opponent"] == second_team]
     second_h2h = second.loc[second["opponent"] == first_team]
     
-    # 计算动态权重：每多交手1局增加15%权重，最高封顶 70% (0.7)
     h2h_count = len(first_h2h)
     w_h2h = min(0.70, h2h_count * 0.15)
     w_gen = 1.0 - w_h2h
@@ -233,14 +246,11 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
         first_side = "蓝方" if (game_number % 2 == 1) == blue_first else "红方"
         second_side = "红方" if first_side == "蓝方" else "蓝方"
         
-        # 1. 计算常规宏观预测数据
         gen_prob, gen_duration, interval = game_prediction(first, second, first_side, completed_durations)
         
-        # 2. 如果存在交手记录，通过动态权重混合预测数据
         if h2h_count > 0:
             h2h_prob = first_h2h["won"].mean()
             h2h_duration = first_h2h["duration_seconds"].mean()
-            
             probability = w_h2h * h2h_prob + w_gen * gen_prob
             duration = w_h2h * h2h_duration + w_gen * gen_duration
         else:
@@ -258,16 +268,13 @@ def matchup_forecast(data: pd.DataFrame, first_team: str, second_team: str, firs
             f"{second_team} 胜率": f"{1 - probability:.1%}",
         }
         
-        # 3. 对各项资源指标也应用动态权重混合
         for metric in STAT_COLUMNS:
             v1_gen = metric_profile(first, first_side, metric, fallback_metrics[metric])
             v2_gen = metric_profile(second, second_side, metric, fallback_metrics[metric])
             
             if h2h_count > 0:
-                # 在交手记录中查找对应方位的数据，如果方位样本缺失则回退到其交手综合数据
                 v1_h2h = metric_profile(first_h2h, first_side, metric, v1_gen)
                 v2_h2h = metric_profile(second_h2h, second_side, metric, v2_gen)
-                
                 v1 = w_h2h * v1_h2h + w_gen * v1_gen
                 v2 = w_h2h * v2_h2h + w_gen * v2_gen
             else:
@@ -362,35 +369,56 @@ def render_team_dashboard(data: pd.DataFrame, selected: str) -> None:
     if {"team1", "team2"}.issubset(data.columns):
         future = data.loc[data["win"].isna() & (data["team1"].eq(selected) | data["team2"].eq(selected))].copy()
     rate = f"{wins / len(included):.0%}" if len(included) else "—"
+    
     first, second, third = st.columns(3)
     first.metric("胜率", rate, f"{wins} 胜 · {losses} 负" if len(played) else "暂无已完成对局")
     second.metric(f"{selected}击杀数", average_or_dash(included["击杀数"]) if not included.empty else "—", "纳入平均的每场数据")
     third.metric("平均比赛时长", as_minutes_seconds(average_duration), f"{len(future)} 场待赛")
+    
     st.subheader("完整数据汇总")
     st.caption(iqr_note)
     if included.empty:
         st.info(f"{selected} 暂无已完成对局，赛果写入 Excel 后会自动计算全部指标。")
     else:
         st.dataframe(dashboard_table(included, selected), use_container_width=True, hide_index=True)
+        
+        # --- 新增：一血和一塔对胜负的影响关系展示 ---
+        st.subheader("🎯 前期节奏与胜负影响关系")
+        fk_games = included.dropna(subset=["got_first_kill"])
+        ft_games = included.dropna(subset=["got_first_tower"])
+        
+        fk_win_rate = (fk_games.loc[fk_games["got_first_kill"], "won"].mean() if not fk_games.empty else 0) * 100
+        ft_win_rate = (ft_games.loc[ft_games["got_first_tower"], "won"].mean() if not ft_games.empty else 0) * 100
+        
+        col_a, col_b = st.columns(2)
+        col_a.metric("拿到【一血】时的胜率", f"{fk_win_rate:.1f}%" if not fk_games.empty else "—", f"基于 {len(fk_games)} 场有效样本")
+        col_b.metric("拿到【一塔】时的胜率", f"{ft_win_rate:.1f}%" if not ft_games.empty else "—", f"基于 {len(ft_games)} 场有效样本")
+        
         st.subheader("红蓝方胜率")
         st.bar_chart(included.groupby("side", sort=False)["won"].mean().reindex(["蓝方", "红方"]).fillna(0).mul(100).rename("胜率（%）"), y="胜率（%）")
+        
     st.subheader("已完成对局")
     if played.empty:
         st.caption("暂无已完成对局")
     else:
         played["对手"] = played["opponent"]
         played["结果"] = played["won"].map({True: "胜", False: "负"})
+        played["一血"] = played["got_first_kill"].map({True: "是", False: "否"})
+        played["一塔"] = played["got_first_tower"].map({True: "是", False: "否"})
         played["时长"] = played["duration_seconds"].map(as_minutes_seconds)
         played["平均计算"] = played["纳入平均"].map({True: "纳入", False: "时长异常，剔除"})
+        
         display_stats = []
         for metric in STAT_COLUMNS:
             display_stats.extend([f"总{metric}", metric])
-        fields = [field for field in ("date", "event", "side", "对手", "结果", "时长", *display_stats, "平均计算") if field in played.columns]
+            
+        fields = [field for field in ("date", "event", "side", "对手", "结果", "一血", "一塔", "时长", *display_stats, "平均计算") if field in played.columns]
         result_table = played[fields].copy()
         if "date" in result_table:
             result_table["date"] = result_table["date"].map(display_date)
         rename_columns = {"date": "日期", "event": "赛事", "side": "方位", **{metric: f"{selected}{metric}" for metric in STAT_COLUMNS}}
         st.dataframe(result_table.rename(columns=rename_columns), use_container_width=True, hide_index=True)
+        
     st.subheader("待赛赛程")
     if future.empty:
         st.caption("暂无待赛赛程")
@@ -461,7 +489,8 @@ def render_matchup_dashboard(data: pd.DataFrame, teams: list[str]) -> None:
     
     comparison = table1.merge(table2, on="通用指标", how="outer", suffixes=("", "_drop"))
     
-    ordered_metrics = ["纳入平均的场次", "胜率", "平均比赛时长"]
+    # 调整排序指标：包含一血率和一塔率
+    ordered_metrics = ["纳入平均的场次", "胜率", "一血率", "一塔率", "平均比赛时长"]
     for m in STAT_COLUMNS:
         ordered_metrics.extend([m, f"总{m}"])
     
